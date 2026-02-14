@@ -5,6 +5,11 @@ Reproduces methodology from Solano, Villarroel & Rodrigo (2022, MNRAS 515, 1380)
 The basic idea... POSS-I photographed the sky twice per field, once through a red filter and once through blue. A real astronomical source shows up on both plates. Something
 that only appears on one plate (and has no match w/modern catalog) is a transient. Solano's team found 298,165 of these via red plates
 This script does the same thing from scratch using publicly available plate scans from IRSA and modern catalog data from VizieR. See the accompanying README for full doc.
+
+IR crossmatch (AllWISE, 2MASS, CatWISE, UKIDSS) is OFF by default.
+Villarroel confirmed the 107k VASCO catalog was never crossmatched
+against IR catalogs. Use --ir to enable it.
+
 Requirements
     - SExtractor (apt install source-extractor)
     - PSFEx (apt install psfex)
@@ -398,14 +403,17 @@ def _query_catalog(catalog_id, columns, ra_center, dec_center, radius_deg,
     return coords
 
 
-def crossmatch_modern_catalogs(df, cache_dir, plate_epoch=1953.0):
+def crossmatch_modern_catalogs(df, cache_dir, plate_epoch=1953.0, use_ir=False):
     """
-    Check source against seven modern catalogs. Anything w/match
+    Check source against modern catalogs. Anything w/match
     is a known object & gets flagged for removal.
-    Catalogs are the same ones Solano used
-      Primary:  Gaia EDR3, PanSTARRS DR2
-      Infrared: AllWISE, 2MASS, CatWISE2020, UKIDSS-LAS
-      Second epoch optical: SuperCOSMOS POSS-II digitization
+
+    Primary (always):  Gaia EDR3, PanSTARRS DR2
+    Infrared (--ir):   AllWISE, 2MASS, CatWISE2020, UKIDSS-LAS
+    Second epoch:      SuperCOSMOS (POSS-II digitization)
+
+    IR catalogs are off by default because the published 107k VASCO
+    catalog was never IR-crossmatched (confirmed by Villarroel).
 
     Gaia proper motions are corrected back to the POSS-I epoch approx. 1951
     so that high proper motion stars still get matched.
@@ -492,41 +500,48 @@ def crossmatch_modern_catalogs(df, cache_dir, plate_epoch=1953.0):
         return df
 
     # **** Infrared catalogs candidates only query parallel ****
+    # OFF by default. The 107k VASCO catalog was never IR-matched
+    # (confirmed by Villarroel). Enable with --ir flag.
 
-    print(f"\n  Checking {n_remaining} candidates against IR catalogs...")
-    cand_idx = np.where(~matched)[0]
-    cand_sky = SkyCoord(ra=df.iloc[cand_idx]["ALPHA_J2000"].values,
-                        dec=df.iloc[cand_idx]["DELTA_J2000"].values, unit="deg")
+    if use_ir:
+        print(f"\n  Checking {n_remaining} candidates against IR catalogs...")
+        cand_idx = np.where(~matched)[0]
+        cand_sky = SkyCoord(ra=df.iloc[cand_idx]["ALPHA_J2000"].values,
+                            dec=df.iloc[cand_idx]["DELTA_J2000"].values, unit="deg")
 
-    ir_catalogs = [
-        ("II/328/allwise", ["RAJ2000", "DEJ2000"], "RAJ2000", "DEJ2000", "AllWISE"),
-        ("II/246/out",     ["RAJ2000", "DEJ2000"], "RAJ2000", "DEJ2000", "2MASS"),
-        ("II/365/catwise", ["RA_ICRS", "DE_ICRS"], "RA_ICRS", "DE_ICRS", "CatWISE2020"),
-        ("II/319/las9",    ["RAJ2000", "DEJ2000"], "RAJ2000", "DEJ2000", "UKIDSS-LAS"),
-    ]
+        ir_catalogs = [
+            ("II/328/allwise", ["RAJ2000", "DEJ2000"], "RAJ2000", "DEJ2000", "AllWISE"),
+            ("II/246/out",     ["RAJ2000", "DEJ2000"], "RAJ2000", "DEJ2000", "2MASS"),
+            ("II/365/catwise", ["RA_ICRS", "DE_ICRS"], "RA_ICRS", "DE_ICRS", "CatWISE2020"),
+            ("II/319/las9",    ["RAJ2000", "DEJ2000"], "RAJ2000", "DEJ2000", "UKIDSS-LAS"),
+        ]
 
-    ir_matched = np.zeros(len(cand_idx), dtype=bool)
+        ir_matched = np.zeros(len(cand_idx), dtype=bool)
 
-    def fetch_ir(cat_id, cols, rk, dk, name):
-        coords = _query_catalog(cat_id, cols, ra_center, dec_center,
-                                search_radius, rk, dk, name, cache_dir)
-        return name, coords
+        def fetch_ir(cat_id, cols, rk, dk, name):
+            coords = _query_catalog(cat_id, cols, ra_center, dec_center,
+                                    search_radius, rk, dk, name, cache_dir)
+            return name, coords
 
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = [pool.submit(fetch_ir, *cat) for cat in ir_catalogs]
-        for fut in as_completed(futures):
-            name, coords = fut.result()
-            if coords is not None:
-                idx, _, _, _ = search_around_sky(cand_sky, coords,
-                                                 MATCH_RADIUS * u.arcsec)
-                new = len(set(idx[~ir_matched[idx]]))
-                ir_matched[idx] = True
-                print(f"  {name}: {new} new matches")
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(fetch_ir, *cat) for cat in ir_catalogs]
+            for fut in as_completed(futures):
+                name, coords = fut.result()
+                if coords is not None:
+                    idx, _, _, _ = search_around_sky(cand_sky, coords,
+                                                     MATCH_RADIUS * u.arcsec)
+                    new = len(set(idx[~ir_matched[idx]]))
+                    ir_matched[idx] = True
+                    print(f"  {name}: {new} new matches")
 
-    for i, ci in enumerate(cand_idx):
-        if ir_matched[i]:
-            matched[ci] = True
-    print(f"  IR catalogs removed: {ir_matched.sum()} total")
+        for i, ci in enumerate(cand_idx):
+            if ir_matched[i]:
+                matched[ci] = True
+        print(f"  IR catalogs removed: {ir_matched.sum()} total")
+
+        n_remaining = (~matched).sum()
+    else:
+        print(f"\n  IR crossmatch: skipped (use --ir to enable)")
 
     # **** SuperCOSMOS 2nd epoch check ****
     
@@ -600,6 +615,78 @@ def compare_to_vasco(candidates, vasco_csv, plate_num):
     print(f"  Extras:     {n_ours_total - n_our_matched}")
     print(f"  Missed:     {n_vasco_total - n_vasco_found}")
 
+#  Southern hemisphere exclusion
+
+def apply_dec_cutoff(df, dec_min=-30.0):
+    """
+    Remove sources below a declination limit. POSS-I southern fringe
+    plates (roughly dec < -30) were excluded from the published VASCO
+    catalog. This matches that boundary.
+    """
+    n_before = len(df)
+    df = df[df["DELTA_J2000"] >= dec_min].copy()
+    n_removed = n_before - len(df)
+    if n_removed > 0:
+        print(f"  Dec cutoff (>= {dec_min}): removed {n_removed}, "
+              f"{len(df)} remain")
+    return df
+
+#  Cross-plate deduplication
+
+def deduplicate_across_plates(df, prev_results_dir, radius_arcsec=5.0):
+    """
+    For multi-plate runs: flag candidates that were already detected
+    on a previously processed overlapping plate. POSS-I plates overlap
+    by ~1 degree at edges, so the same transient can appear on 2-4 plates.
+
+    Reads all transients_*.csv files in prev_results_dir, builds a master
+    coordinate list, and marks any new candidate within radius as a dupe.
+    """
+    import glob as _glob
+
+    prev_files = _glob.glob(os.path.join(prev_results_dir, "transients_*.csv"))
+    if not prev_files:
+        print(f"  Dedup: no previous results in {prev_results_dir}")
+        return df
+
+    prev_frames = []
+    for f in prev_files:
+        try:
+            prev_frames.append(pd.read_csv(f))
+        except Exception:
+            pass
+
+    if not prev_frames:
+        return df
+
+    prev_all = pd.concat(prev_frames, ignore_index=True)
+    if "ALPHA_J2000" not in prev_all.columns:
+        print(f"  Dedup: previous CSVs missing coordinate columns")
+        return df
+
+    prev_sky = SkyCoord(ra=prev_all["ALPHA_J2000"].values,
+                        dec=prev_all["DELTA_J2000"].values, unit="deg")
+    new_sky = SkyCoord(ra=df["ALPHA_J2000"].values,
+                       dec=df["DELTA_J2000"].values, unit="deg")
+
+    idx_new, _, _, _ = search_around_sky(new_sky, prev_sky,
+                                          radius_arcsec * u.arcsec)
+    dupes = set(idx_new)
+    n_dupes = len(dupes)
+
+    if n_dupes > 0:
+        keep = np.ones(len(df), dtype=bool)
+        for i in dupes:
+            keep[i] = False
+        df = df[keep].copy()
+        print(f"  Dedup: {n_dupes} duplicates from overlapping plates removed, "
+              f"{len(df)} unique remain")
+    else:
+        print(f"  Dedup: no duplicates found (checked against "
+              f"{len(prev_all)} previous detections)")
+
+    return df
+
 #  Main
 
 def main():
@@ -614,6 +701,20 @@ def main():
                         help="Where to put everything (default: ./output)")
     parser.add_argument("--red-only", action="store_true",
                         help="Skip blue plate download and red-vs-blue step")
+    parser.add_argument("--ir", action="store_true",
+                        help="Enable IR crossmatch (AllWISE, 2MASS, CatWISE, "
+                             "UKIDSS). Off by default -- the published 107k "
+                             "VASCO catalog was not IR-matched (confirmed by "
+                             "Villarroel).")
+    parser.add_argument("--dec-min", type=float, default=-30.0,
+                        help="Minimum declination cutoff (default: -30). "
+                             "POSS-I southern fringe plates below this were "
+                             "excluded from the published catalog.")
+    parser.add_argument("--dedup-dir",
+                        help="Path to directory containing previous plate "
+                             "results CSVs. New candidates within 5 arcsec "
+                             "of existing detections are flagged as duplicates "
+                             "from overlapping plates.")
     args = parser.parse_args()
 
     plate = args.plate
@@ -625,6 +726,7 @@ def main():
     print(f"  POSS-I Transient Detection Pipeline")
     print(f"  Plate {plate}  (red = XE{plate}, blue = XO{plate})")
     print(f"  Mode: {'red only' if args.red_only else 'red + blue comparison'}")
+    print(f"  IR crossmatch: {'enabled' if args.ir else 'disabled (use --ir)'}")
     print("=" * 60)
 
     # Step 1 get the plates... and wait
@@ -671,8 +773,16 @@ def main():
 
     # Step 5 crossmatch against modern catalogs
     print(f"\n[5/6] Crossmatching {len(candidates)} sources against modern catalogs...")
-    candidates = crossmatch_modern_catalogs(candidates, cache_dir)
+    candidates = crossmatch_modern_catalogs(candidates, cache_dir,
+                                              use_ir=args.ir)
     final = candidates[~candidates["is_known"]].copy()
+
+    # Southern hemisphere exclusion
+    final = apply_dec_cutoff(final, args.dec_min)
+
+    # Cross-plate deduplication (multi-plate runs only)
+    if args.dedup_dir:
+        final = deduplicate_across_plates(final, args.dedup_dir)
 
     # Step 6 compare to VASCO if catalog provided
     if args.vasco:
