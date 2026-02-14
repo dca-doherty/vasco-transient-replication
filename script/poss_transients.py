@@ -283,12 +283,11 @@ def extract_sources(fits_path, work_dir, label="plate"):
 #  Morphological quality filters
 def apply_quality_filters(df, label="plate"):
     """
-    Apply t same source quality cuts described in Solano et al. (2022).
+    Apply the same source quality cuts described in Solano et al. (2022).
 
-    Deliberately do NOT apply MAD **median absolute deviation** clipping
-    on FWHM or elongation. Solano's paper doesn't describe using it, and
-    on photographic plates it removes real transients whose morphology
-    legit differs from the stellar pop. Testing showed it killed 30% of VASCO sources w/ no precision benefits
+    Includes MAD (median absolute deviation) clipping on FWHM and
+    elongation as described in the paper: sources deviating more than
+    2*MAD from the median are removed.
     """
     n_start = len(df)
 
@@ -320,10 +319,32 @@ def apply_quality_filters(df, label="plate"):
     df = df[np.abs(dx - dy) <= SYMMETRY_TOL].copy()
     print(f"  [{label}] Symmetry <= {SYMMETRY_TOL} px: {n} -> {len(df)}")
 
+    # Min bounding box (Solano: XMAX-XMIN > 1 and YMAX-YMIN > 1)
+    n = len(df)
+    dx = df["XMAX_IMAGE"] - df["XMIN_IMAGE"]
+    dy = df["YMAX_IMAGE"] - df["YMIN_IMAGE"]
+    df = df[(dx > 1) & (dy > 1)].copy()
+    print(f"  [{label}] Min bbox > 1 px: {n} -> {len(df)}")
+
     # Signal 2 noise
     n = len(df)
     df = df[df["SNR_WIN"] >= SNR_MIN].copy()
     print(f"  [{label}] SNR >= {SNR_MIN}: {n} -> {len(df)}")
+
+    # MAD clipping on FWHM and elongation (Solano: 2-sigma from median)
+    n = len(df)
+    for col in ["FWHM_IMAGE", "ELONGATION"]:
+        med = df[col].median()
+        mad = np.median(np.abs(df[col] - med))
+        sigma = 1.4826 * mad  # MAD to std deviation for normal distribution
+        lo_clip = med - 2 * sigma
+        hi_clip = med + 2 * sigma
+        before = len(df)
+        df = df[(df[col] >= lo_clip) & (df[col] <= hi_clip)].copy()
+        print(f"  [{label}] MAD clip {col}: median={med:.3f}, "
+              f"sigma={sigma:.3f}, range=[{lo_clip:.3f}, {hi_clip:.3f}], "
+              f"{before} -> {len(df)}")
+    print(f"  [{label}] After MAD clipping: {n} -> {len(df)}")
 
     pct = 100 * len(df) / max(n_start, 1)
     print(f"  [{label}] Kept {len(df)}/{n_start} sources ({pct:.1f}%)")
