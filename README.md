@@ -95,13 +95,13 @@ Source extraction happens in two passes per plate.
 The pipeline applies the same quality filters described in Solano et al. (2022)
 
 - **FLAGS = 0**: No SExtractor warnings (blending, saturation, edge proximity)
-- **SPREAD_MODEL > -0.01**: Rejects cosmic rays and sharp defects. The published threshold is -0.002, but our PSFEx models on photographic plates produce slightly different SPREAD_MODEL distributions than the original pipeline. At -0.002, we lose roughly half of the known VASCO sources. At -0.01, we retain 97% of them while still removing the worst artifacts.
+- **SPREAD_MODEL > -0.01**: Rejects cosmic rays and sharp defects. The published threshold is -0.002, but our PSFEx models on photographic plates produce slightly different SPREAD_MODEL distributions than the original pipeline. At -0.002, lose roughly half of the known VASCO sources. At -0.01, retain 97% of them while still removing the worst artifacts.
 - **FWHM between 2 and 7 pixels**: Rejects unresolved noise spikes (too small) and extended objects (too large)
 - **ELONGATION < 1.3**: Rejects streaks and satellite trails
 - **Symmetry < 2 pixels**: Rejects sources where the bounding box is not roughly square
 - **SNR >= 30**: Rejects faint or noisy detections
 
-One filter that we deliberately omit is the Median Absolute Deviation (MAD) clipping on FWHM and elongation. This is sometimes used in CCD survey pipelines to remove outliers relative to the plate median, but Solano did not describe using it, and on photographic plates it aggressively removes real transients whose morphology legitimately differs from the stellar population. Applying MAD filtering reduces recall by roughly 30 percent with no improvement in precision.
+One filter that was deliberately omit is the Median Absolute Deviation (MAD) clipping on FWHM and elongation. This is sometimes used in CCD survey pipelines to remove outliers relative to the plate median, but Solano did not describe using it, and on photographic plates it aggressively removes real transients whose morphology legitimately differs from the stellar population. Applying MAD filtering reduces recall by roughly 30 percent with no improvement in precision.
 
 ### Step 4: Red Versus Blue Comparison
 
@@ -134,7 +134,7 @@ All query results are cached to disk in the `cache/` subdirectory. If you rerun 
 
 ### Step 6: VASCO Comparison
 
-The final candidate list is crossmatched against the published VASCO catalog at 5 arcseconds. The pipeline reports recall (what fraction of VASCO entries we recovered), precision (what fraction of our candidates match VASCO), and F1 score.
+The final candidate list is crossmatched against the published VASCO catalog at 5 arcseconds. The pipeline reports recall (what fraction of VASCO entries recovered), precision (what fraction of our candidates match VASCO), and F1 score.
 
 ## Running the Pipeline
 
@@ -214,7 +214,7 @@ Based on testing with plate XE582 (166 published VASCO transients):
 
 ## Known Limits
 
-**SPREAD_MODEL calibration.** The PSFEx models built from photographic plate scans produce SPREAD_MODEL distributions that are shifted compared to models built from CCD data. The published Solano threshold of -0.002 rejects roughly half of known VASCO sources when applied to our PSF models. We use -0.01 as a compromise. This retains 97% of VASCO sources but allows more false positives through. The red-versus-blue comparison handles most of these.
+**SPREAD_MODEL calibration.** The PSFEx models built from photographic plate scans produce SPREAD_MODEL distributions that are shifted compared to models built from CCD data. The published Solano threshold of -0.002 rejects roughly half of known VASCO sources when applied to our PSF models. Used -0.01 as a compromise. This retains 97% of VASCO sources but allows more false positives through. The red-versus-blue comparison handles most of these.
 
 **No asteroid removal.** Solano used the SkyBoT service (IMCCE) to identify known asteroids by checking if any minor planet was at each source's coordinates at the time of observation. This pipeline does not currently include SkyBoT queries. The published catalog flagged 189 sources as asteroids out of 298,165 initial detections, so the impact is small but not zero.
 
