@@ -1,0 +1,11 @@
+*.fits
+*.pkl
+*.cat
+*.psf
+*.pyc
+__pycache__/
+work_red/
+work_blue/
+cache/
+full_plate_output/
+SUPERVIKTIG_HELAVASCO.csv
