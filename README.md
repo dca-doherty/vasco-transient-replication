@@ -7,7 +7,7 @@ Publicly Sourced Data Replication of VASCO Palomar Transients Script
 
 This document describes an open-source pipeline that independently reproduces the transient catalog published by Solano, Villarroel, and Rodrigo (2022) in Monthly Notices of the Royal Astronomical Society. Their catalog identified 5,399 "vanishing" sources on photographic plates from the First Palomar Observatory Sky Survey (POSS-I), conducted between 1949 and 1958. These are point sources that appeared on the original red-sensitive plates but have no counterpart in any modern astronomical survey.
 
-The pipeline downloads the original digitized plate scans from NASA's Infrared Science Archive (IRSA), extracts sources using SExtractor and PSFEx, applies morphological quality filters, performs a red-versus-blue plate comparison to isolate true transients, and then crossmatches surviving candidates against seven modern catalogs to remove persistent objects. The output is a list of transient candidates that can be compared directly against the published VASCO catalog.
+The pipeline downloads the original digitized plate scans from NASA's Infrared Science Archive (IRSA), extracts sources using SExtractor and PSFEx, applies morphological quality filters, performs a red-versus-blue plate comparison to isolate true transients, and then crossmatches surviving candidates against modern catalogs (Gaia, PanSTARRS, SuperCOSMOS) to remove persistent objects. Infrared catalog crossmatching is available as an option but disabled by default, since the published 107,000-source VASCO catalog was never crossmatched against IR (confirmed by Villarroel). The pipeline also applies a southern hemisphere declination cutoff and supports cross-plate deduplication for multi-plate runs. The output is a list of transient candidates that can be compared directly against the published VASCO catalog.
 
 The goal is full reproducibility. Anyone with a Linux machine, the required software, and enough disk space should be able to run this pipeline and arrive at the same set of transients that VASCO published.
 
@@ -61,7 +61,7 @@ pip install numpy pandas astropy astroquery matplotlib scipy
 
 ### Network Access
 
-The pipeline downloads plate scans from IRSA and queries VizieR for catalog crossmatching. You need a reliable internet connection. Catalog queries for a single plate pull several million rows across seven catalogs and can take 10 to 15 minutes depending on your connection and VizieR server load. The pipeline caches all query results to disk, so subsequent runs of the same plate skip the network entirely.
+The pipeline downloads plate scans from IRSA and queries VizieR for catalog crossmatching. You need a reliable internet connection. Catalog queries for a single plate pull several million rows across three primary catalogs (or seven with `--ir` enabled) and can take 5 to 15 minutes depending on your connection and VizieR server load. The pipeline caches all query results to disk, so subsequent runs of the same plate skip the network entirely.
 
 If you are behind a corporate firewall or proxy, you may need to configure the `HTTP_PROXY` and `HTTPS_PROXY` environment variables for both the plate downloads and the astroquery VizieR calls.
 
@@ -115,24 +115,34 @@ Not all POSS-I fields have blue plate scans available on IRSA. If the blue plate
 
 ### Step 5: Catalog Crossmatch
 
-Surviving candidates are crossmatched against seven modern astronomical catalogs to remove any source that has a known counterpart today. The catalogs are queried via VizieR with a 5 degree search radius centered on the plate:
+Surviving candidates are crossmatched against modern astronomical catalogs to remove any source that has a known counterpart today. The catalogs are queried via VizieR with a 5 degree search radius centered on the plate:
 
-**Primary catalogs** (queried in parallel)
+**Primary catalogs** (always run, queried in parallel)
 - Gaia EDR3 (300,000+ sources per plate). Proper motions are corrected from the Gaia epoch (2016) back to the POSS-I epoch (approximately 1951) to account for stellar motion over 65 years.
 - PanSTARRS DR2 (1.5 to 2 million sources per plate)
 
-**Infrared catalogs** (queried in parallel, candidates only)
+**Infrared catalogs** (optional, disabled by default, enable with `--ir`)
 - AllWISE
 - 2MASS
 - CatWISE2020
 - UKIDSS-LAS (northern sky only)
+
+Villarroel confirmed that the published 107,000-source VASCO catalog was never crossmatched against infrared catalogs. The IR step is kept as an option for users who want stricter filtering, but it's off by default to match the actual methodology that produced the published catalog.
 
 **Second-epoch optical**:
 - SuperCOSMOS (digitization of POSS-II plates from the 1980s and 1990s)
 
 All query results are cached to disk in the `cache/` subdirectory. If you rerun the pipeline on the same plate, the cached results are loaded instantly. Clearing the cache forces fresh queries.
 
-### Step 6: VASCO Comparison
+### Step 6: Southern Hemisphere Exclusion
+
+POSS-I included some southern fringe plates that extend below declination -30 degrees. These were excluded from the published VASCO catalog. The pipeline applies a declination cutoff (default -30 degrees) and removes any candidate below that limit. This can be adjusted with the `--dec-min` flag if needed, but the default matches the published boundary.
+
+### Step 7: Cross-Plate Deduplication
+
+POSS-I plates overlap by about 1 degree at their edges. The same transient source can appear on two to four adjacent plates. For multi-plate runs, the pipeline can deduplicate by checking new candidates against previously processed results. Any candidate within 5 arcseconds of an existing detection in a previous plate's output is flagged as a duplicate and removed. This is only active when you provide a `--dedup-dir` pointing to the directory containing your previous `transients_*.csv` files.
+
+### Step 8: VASCO Comparison
 
 The final candidate list is crossmatched against the published VASCO catalog at 5 arcseconds. The pipeline reports recall (what fraction of VASCO entries recovered), precision (what fraction of our candidates match VASCO), and F1 score.
 
@@ -166,15 +176,25 @@ Skips the blue plate download and red-versus-blue comparison. Useful for quick t
 ```
 python3 poss_transients.py --plate 582 --output-dir /data/poss_i/582
 ```
+
+### With IR Crossmatch
+
+```
+python3 poss_transients.py --plate 582 --vasco vasco_catalog.csv --ir
+```
+Enables the infrared catalog crossmatch (AllWISE, 2MASS, CatWISE2020, UKIDSS). This is off by default because the published VASCO catalog was not IR-crossmatched. Turning it on will remove a small number of additional candidates (typically 1-2% of the total) that have infrared counterparts.
+
 ### Processing All 936 Plates
 
-There is no built-in batch mode yet. To process every plate, you would write a wrapper script that loops over plate numbers. Something like:
+There is no built-in batch mode yet. To process every plate, you would write a wrapper script that loops over plate numbers. Using `--dedup-dir` pointed at a shared output directory handles the overlapping-plate problem automatically:
 
 ```bash
 for num in $(seq 1 936); do
-    python3 poss_transients.py --plate $num --output-dir ./output/plate_$num
+    python3 poss_transients.py --plate $num --output-dir ./output --dedup-dir ./output
 done
 ```
+
+Each plate's results are saved as `transients_{num}.csv` in the output directory. When the next plate runs, it reads all existing result files and removes any duplicate detections from overlapping plate edges.
 
 **Be careful with this.** Processing all 936 plates will
 - Download approximately 750 GB of plate scans (1,872 FITS files)
@@ -209,7 +229,8 @@ Based on testing with plate XE582 (166 published VASCO transients):
 | SExtractor pass 2 | 30 to 40 seconds |
 | Gaia query (or cache load) | 2 to 4 minutes |
 | PanSTARRS query | 2 to 4 minutes |
-| IR + SuperCOSMOS queries | 3 to 6 minutes |
+| SuperCOSMOS query | 1 to 2 minutes |
+| IR queries (if --ir enabled) | 3 to 6 minutes |
 | Total per plate | 25 to 40 minutes |
 
 ## Known Limits
@@ -224,7 +245,7 @@ Based on testing with plate XE582 (166 published VASCO transients):
 
 **Single-threaded extraction.** SExtractor and PSFEx are both single-threaded. The dominant time cost is PSFEx (15 to 25 minutes per plate). There is no way to speed this up on a single plate, but multiple plates can be processed in parallel.
 
-**VizieR query volume.** Each plate queries roughly 5 to 10 million catalog rows across seven catalogs. VizieR is a shared public resource. If you are processing many plates in rapid succession, space out your runs or use the cached results to minimize repeated queries.
+**VizieR query volume.** Each plate queries roughly 2 to 4 million catalog rows across the primary catalogs (Gaia, PanSTARRS, SuperCOSMOS). With `--ir` enabled, this increases to 5 to 10 million rows across seven catalogs. VizieR is a shared public resource. If you are processing many plates in rapid succession, space out your runs or use the cached results to minimize repeated queries.
 
 ## File Structure
 
@@ -247,11 +268,11 @@ output/
         Gaia_EDR3.pkl
         Gaia_EDR3_full.pkl
         PanSTARRS_DR2.pkl
-        AllWISE.pkl
-        2MASS.pkl
-        CatWISE2020.pkl
-        UKIDSS-LAS.pkl
         SuperCOSMOS.pkl
+        AllWISE.pkl             # Only present if --ir was used
+        2MASS.pkl               # Only present if --ir was used
+        CatWISE2020.pkl         # Only present if --ir was used
+        UKIDSS-LAS.pkl          # Only present if --ir was used
 ```
 Delete the `cache/` directory to force fresh catalog queries on the next run. Delete the FITS files to force fresh downloads. The working directories can be deleted after processing; they are not needed for the final results.
 
