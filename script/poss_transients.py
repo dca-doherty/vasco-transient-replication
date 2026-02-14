@@ -118,7 +118,7 @@ def _write_sextractor_config(work_dir, psf_path=None):
         f.write("SAMPLE_FWHMRANGE 2.0,20.0\n")
         f.write("SAMPLE_VARIABILITY 0.3\n")
         f.write("SAMPLE_MINSN     20\n")
-
+        f.write("SAMPLE_MAXSOURCES   5000\n")
     # Output params
     params = [
         "NUMBER", "ALPHA_J2000", "DELTA_J2000",
