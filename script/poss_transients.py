@@ -285,9 +285,13 @@ def apply_quality_filters(df, label="plate"):
     """
     Apply the same source quality cuts described in Solano et al. (2022).
 
-    Includes MAD (median absolute deviation) clipping on FWHM and
-    elongation as described in the paper: sources deviating more than
-    2*MAD from the median are removed.
+    Includes per-region MAD (median absolute deviation) clipping on FWHM
+    and elongation. Solano tessellated the sky in 30-arcmin circular
+    regions so the PSF was locally uniform. We approximate this with a
+    grid of ~1060-pixel cells and apply 2-sigma MAD clipping within
+    each cell. This avoids the over-clipping that occurs when computing
+    MAD globally across the full 6.5-degree plate where PSF varies
+    spatially.
     """
     n_start = len(df)
 
@@ -331,20 +335,61 @@ def apply_quality_filters(df, label="plate"):
     df = df[df["SNR_WIN"] >= SNR_MIN].copy()
     print(f"  [{label}] SNR >= {SNR_MIN}: {n} -> {len(df)}")
 
-    # MAD clipping on FWHM and elongation (Solano: 2-sigma from median)
+    # Per-region MAD clipping on FWHM and elongation (Solano 2-sigma)
+    # Solano tessellated the sky in 30-arcmin circular regions so the
+    # PSF was locally uniform within each patch. We approximate this
+    # with a grid of ~1060-pixel cells (30 arcmin at ~1.7"/px).
+    # Local MAD avoids penalising sources at plate edges where the PSF
+    # is broader or more elongated than at the center.
     n = len(df)
+    CELL_PX = 1060  # ~30 arcmin at POSS-I plate scale
+    MIN_SOURCES = 30  # need enough for a reliable MAD
+    MAD_NSIGMA = 2.0  # Solano's published value; safe with local regions
+
+    keep_mask = np.ones(len(df), dtype=bool)
+
     for col in ["FWHM_IMAGE", "ELONGATION"]:
-        med = df[col].median()
-        mad = np.median(np.abs(df[col] - med))
-        sigma = 1.4826 * mad  # MAD to std deviation for normal distribution
-        lo_clip = med - 2 * sigma
-        hi_clip = med + 2 * sigma
-        before = len(df)
-        df = df[(df[col] >= lo_clip) & (df[col] <= hi_clip)].copy()
-        print(f"  [{label}] MAD clip {col}: median={med:.3f}, "
-              f"sigma={sigma:.3f}, range=[{lo_clip:.3f}, {hi_clip:.3f}], "
-              f"{before} -> {len(df)}")
-    print(f"  [{label}] After MAD clipping: {n} -> {len(df)}")
+        vals = df[col].values
+        x = df["X_IMAGE"].values
+        y = df["Y_IMAGE"].values
+
+        x_bins = np.arange(0, x.max() + CELL_PX, CELL_PX)
+        y_bins = np.arange(0, y.max() + CELL_PX, CELL_PX)
+        xi = np.digitize(x, x_bins) - 1
+        yi = np.digitize(y, y_bins) - 1
+
+        col_mask = np.ones(len(df), dtype=bool)
+        cells_used = 0
+        cells_skipped = 0
+
+        for ix in range(len(x_bins)):
+            for iy in range(len(y_bins)):
+                cell = (xi == ix) & (yi == iy)
+                n_cell = cell.sum()
+                if n_cell < MIN_SOURCES:
+                    cells_skipped += 1
+                    continue
+                cells_used += 1
+                cell_vals = vals[cell]
+                med = np.median(cell_vals)
+                mad = np.median(np.abs(cell_vals - med))
+                sigma = 1.4826 * mad
+                if sigma < 1e-6:
+                    continue
+                lo_clip = med - MAD_NSIGMA * sigma
+                hi_clip = med + MAD_NSIGMA * sigma
+                outlier = cell & ((vals < lo_clip) | (vals > hi_clip))
+                col_mask[outlier] = False
+
+        before = keep_mask.sum()
+        keep_mask &= col_mask
+        removed = before - keep_mask.sum()
+        print(f"  [{label}] Local MAD clip {col}: {cells_used} cells, "
+              f"{cells_skipped} skipped (< {MIN_SOURCES} src), "
+              f"removed {removed}")
+
+    df = df[keep_mask].copy()
+    print(f"  [{label}] After local MAD clipping: {n} -> {len(df)}")
 
     pct = 100 * len(df) / max(n_start, 1)
     print(f"  [{label}] Kept {len(df)}/{n_start} sources ({pct:.1f}%)")
