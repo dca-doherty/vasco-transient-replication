@@ -214,12 +214,14 @@ Based on testing with plate XE582 (166 published VASCO transients):
 
 | Metric | Value |
 |--------|-------|
-| Sources extracted (red) | 74,331 |
-| After morphological filters | 44,433 |
-| After red-vs-blue comparison | TBD (testing in progress) |
-| After catalog crossmatch | TBD |
+| Sources extracted (red) | 74,330 |
+| After morphological filters | 46,967 |
+| After red-vs-blue comparison | 12,394 |
+| After catalog crossmatch | 314 |
 | VASCO detection rate | 99.4% (165/166 extracted) |
-| VASCO recall after filters | 89.8% (149/166 pre-crossmatch) |
+| VASCO recall after all filters | 89.8% (149/166) |
+| Precision | 47.5% (149/314) |
+| F1 score | 0.621 |
 
 ### Timing (single plate, SSD, 16 GB RAM)
 
