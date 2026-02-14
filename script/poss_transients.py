@@ -50,7 +50,7 @@ DETECT_THRESH    = 5       # sigma above background
 SNR_MIN          = 30      # min signal-to-noise
 SPREAD_MODEL_MIN = -0.01   # cosmic ray rejection (note above)
 FWHM_RANGE       = (2, 7)  # pixels rejects noise spikes + junk
-ELONG_MAX        = 1.3     # rejects streaks
+ELONG_MAX        = 1.4     # rejects streaks (relaxed from 1.3; recovers borderline VASCO sources)
 SYMMETRY_TOL     = 2       # pixels bounding box dx v dy
 MATCH_RADIUS     = 5.0     # arcseconds for all crossmatching
 PLATE_SCALE      = 1.7     # arcsec/pixel for the POSS-I scans
@@ -124,6 +124,9 @@ def _write_sextractor_config(work_dir, psf_path=None):
         f.write("SAMPLE_VARIABILITY 0.3\n")
         f.write("SAMPLE_MINSN     20\n")
         f.write("SAMPLE_MAXSOURCES   5000\n")
+        f.write("CHECKIMAGE_TYPE  NONE\n")
+        f.write("CHECKPLOT_TYPE   NONE\n")
+        f.write("WRITE_XML        N\n")
     # Output params
     params = [
         "NUMBER", "ALPHA_J2000", "DELTA_J2000",
@@ -228,7 +231,7 @@ def extract_sources(fits_path, work_dir, label="plate"):
 
     # **PSF model **
     psf_path = os.path.join(work_dir, "output.psf")
-    print(f"  [{label}] Building PSF model with PSFEx (this takes 15-25 min)...")
+    print(f"  [{label}] Building PSF model with PSFEx...")
     t0 = time.time()
     try:
         subprocess.run(
@@ -314,8 +317,8 @@ def apply_quality_filters(df, label="plate"):
     n = len(df)
     dx = df["XMAX_IMAGE"] - df["XMIN_IMAGE"]
     dy = df["YMAX_IMAGE"] - df["YMIN_IMAGE"]
-    df = df[np.abs(dx - dy) < SYMMETRY_TOL].copy()
-    print(f"  [{label}] Symmetry < {SYMMETRY_TOL} px: {n} -> {len(df)}")
+    df = df[np.abs(dx - dy) <= SYMMETRY_TOL].copy()
+    print(f"  [{label}] Symmetry <= {SYMMETRY_TOL} px: {n} -> {len(df)}")
 
     # Signal 2 noise
     n = len(df)
@@ -631,6 +634,7 @@ def apply_dec_cutoff(df, dec_min=-30.0):
               f"{len(df)} remain")
     return df
 
+
 #  Cross-plate deduplication
 
 def deduplicate_across_plates(df, prev_results_dir, radius_arcsec=5.0):
@@ -686,6 +690,7 @@ def deduplicate_across_plates(df, prev_results_dir, radius_arcsec=5.0):
               f"{len(prev_all)} previous detections)")
 
     return df
+
 
 #  Main
 
