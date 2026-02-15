@@ -50,7 +50,7 @@ DETECT_THRESH    = 5       # sigma above background
 SNR_MIN          = 30      # min signal-to-noise
 SPREAD_MODEL_MIN = -0.01   # cosmic ray rejection (note above)
 FWHM_RANGE       = (2, 7)  # pixels rejects noise spikes + junk
-ELONG_MAX        = 1.3     # rejects streaks
+ELONG_MAX        = 1.4     # rejects streaks
 SYMMETRY_TOL     = 2       # pixels bounding box dx v dy
 MATCH_RADIUS     = 5.0     # arcseconds for all crossmatching
 PLATE_SCALE      = 1.7     # arcsec/pixel for the POSS-I scans
@@ -315,16 +315,60 @@ def apply_quality_filters(df, label="plate"):
     df = df[df["ELONGATION"] < ELONG_MAX].copy()
     print(f"  [{label}] ELONGATION < {ELONG_MAX}: {n} -> {len(df)}")
 
-    # Symmetry bounding box should be square
+    # Symmetry bounding box should be roughly square
     n = len(df)
     dx = df["XMAX_IMAGE"] - df["XMIN_IMAGE"]
     dy = df["YMAX_IMAGE"] - df["YMIN_IMAGE"]
+    df = df[abs(dx - dy) <= SYMMETRY_TOL].copy()
+    print(f"  [{label}] Symmetry <= {SYMMETRY_TOL} px: {n} -> {len(df)}")
 
+    # Min bounding box reject single-pixel detections
+    n = len(df)
+    dx2 = df["XMAX_IMAGE"] - df["XMIN_IMAGE"]
+    dy2 = df["YMAX_IMAGE"] - df["YMIN_IMAGE"]
+    df = df[(dx2 > 1) & (dy2 > 1)].copy()
+    print(f"  [{label}] Min bbox > 1 px: {n} -> {len(df)}")
 
     # Signal 2 noise
     n = len(df)
     df = df[df["SNR_WIN"] >= SNR_MIN].copy()
     print(f"  [{label}] SNR >= {SNR_MIN}: {n} -> {len(df)}")
+
+    # Local MAD clipping on FWHM and ELONGATION
+    # Tessellate plate into cells, reject outliers within each cell
+    n_before_mad = len(df)
+    for col in ["FWHM_IMAGE", "ELONGATION"]:
+        n_cells = 0
+        n_skipped = 0
+        n_removed = 0
+        x_edges = np.linspace(df["X_IMAGE"].min(), df["X_IMAGE"].max(),
+                              int(np.sqrt(len(df) / 50)) + 1)
+        y_edges = np.linspace(df["Y_IMAGE"].min(), df["Y_IMAGE"].max(),
+                              int(np.sqrt(len(df) / 50)) + 1)
+        keep = np.ones(len(df), dtype=bool)
+        for i in range(len(x_edges) - 1):
+            for j in range(len(y_edges) - 1):
+                mask = ((df["X_IMAGE"].values >= x_edges[i]) &
+                        (df["X_IMAGE"].values < x_edges[i+1]) &
+                        (df["Y_IMAGE"].values >= y_edges[j]) &
+                        (df["Y_IMAGE"].values < y_edges[j+1]))
+                n_cells += 1
+                if mask.sum() < 30:
+                    n_skipped += 1
+                    continue
+                vals = df[col].values[mask]
+                med = np.median(vals)
+                mad = np.median(np.abs(vals - med))
+                if mad == 0:
+                    continue
+                outlier = np.abs(vals - med) > 2.0 * mad / 0.6745
+                cell_idx = np.where(mask)[0]
+                keep[cell_idx[outlier]] = False
+                n_removed += outlier.sum()
+        df = df[keep].copy()
+        print(f"  [{label}] Local MAD clip {col}: {n_cells} cells, "
+              f"{n_skipped} skipped (< 30 src), removed {n_removed}")
+    print(f"  [{label}] After local MAD clipping: {n_before_mad} -> {len(df)}")
 
     pct = 100 * len(df) / max(n_start, 1)
     print(f"  [{label}] Kept {len(df)}/{n_start} sources ({pct:.1f}%)")
