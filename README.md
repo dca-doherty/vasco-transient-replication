@@ -33,7 +33,7 @@ The pipeline runs on Linux. It was developed and tested on Ubuntu 24.04 under Wi
 
 Install the following before running the pipeline:
 
-**SExtractor** (also called source-extractor in newer packages)
+**SExtractor** (also called source-extractor in newer packages):
 ```
 sudo apt install source-extractor
 ```
@@ -68,7 +68,7 @@ If you are behind a corporate firewall or proxy, you may need to configure the `
 
 ## How the Pipeline Works
 
-### Step 1 Download Plates
+### Step 1: Download the Plates
 
 Each POSS-I field was photographed twice: once through a red-sensitive emulsion (plate prefix XE) and once through a blue-sensitive emulsion (plate prefix XO). The field numbers match. For example, field 582 has red plate XE582 and blue plate XO582.
 
@@ -78,34 +78,32 @@ The digitized scans are hosted by IRSA at
 
 Each plate is a single FITS file, roughly 14,000 by 14,000 pixels, about 400 MB uncompressed. The pipeline checks if the file already exists before downloading, so interrupted runs can be resumed without re-downloading.
 
-### Step 2 Source Extraction (SExtractor + PSFEx)
+### Step 2: Source Extraction (SExtractor + PSFEx)
 
 Source extraction happens in two passes per plate.
 
 **Pass 1** runs SExtractor without a PSF model. This extracts all detectable sources and includes 35x35 pixel image stamps (VIGNET) around each source. These stamps are needed by PSFEx to build the PSF model. The pass 1 catalog is large (300 to 400 MB) because of the stamps, but it is only used as input to PSFEx and is not carried forward.
 
-**PSFEx** reads the pass 1 catalog and builds a spatially varying PSF model across the plate. Photographic plates have PSFs that change across the field due to optical distortions and emulsion variations. PSFEx fits a polynomial model (degree 2 in X and Y) to capture this. This step takes 15 to 25 minutes per plate and uses about 800 MB of RAM. The output is a `.psf` file used in pass 2.
+**PSFEx** reads the pass 1 catalog and builds a spatially varying PSF model across the plate. Photographic plates have PSFs that change across the field due to optical distortions and emulsion variations. PSFEx fits a polynomial model (degree 2 in X and Y) to capture this. This step takes 1 to 12 minutes per plate and uses about 800 MB of RAM. The output is a `.psf` file used in pass 2. Diagnostic check images and XML output are disabled to prevent I/O hangs on large catalogs.
 
 **Pass 2** runs SExtractor again, this time with the PSF model loaded. This enables the SPREAD_MODEL parameter, which measures how much each source's light profile deviates from the local PSF. Real stars have SPREAD_MODEL near zero. Cosmic rays, hot pixels, and plate defects tend to have strongly negative values. Pass 2 does not include VIGNET stamps, so the catalog is much smaller (under 10 MB) and runs in about 30 to 40 seconds.
 
 **A note on WCS coordinates:** The POSS-I plate scans use a polynomial World Coordinate System (WCS) stored as PLT* keywords in the FITS header. SExtractor cannot read this format and will output all-zero coordinates. The pipeline works around this by using Astropy's WCS module to convert pixel coordinates to sky coordinates after extraction. Astropy reads the PLT* polynomial correctly.
 
-### Step 3 Morphological Filters
+### Step 3: Morphological Filters
 
 The pipeline applies the same quality filters described in Solano et al. (2022)
 
 - **FLAGS = 0**: No SExtractor warnings (blending, saturation, edge proximity)
 - **SPREAD_MODEL > -0.01**: Rejects cosmic rays and sharp defects. The published threshold is -0.002, but our PSFEx models on photographic plates produce slightly different SPREAD_MODEL distributions than the original pipeline. At -0.002, lose roughly half of the known VASCO sources. At -0.01, retain 97% of them while still removing the worst artifacts.
 - **FWHM between 2 and 7 pixels**: Rejects unresolved noise spikes (too small) and extended objects (too large)
-- **ELONGATION < 1.4**: Rejects streaks and satellite trails. The published threshold is 1.3, but relaxing to 1.4 recovers borderline VASCO sources that have slightly elongated morphology on photographic plates without meaningfully increasing false positives.
-- **Symmetry <= 2 pixels**: Rejects sources where the bounding box is not roughly square
-- **Min bounding box > 1 pixel**: Rejects single-pixel detections in both X and Y dimensions
+- **ELONGATION < 1.3**: Rejects streaks and satellite trails
+- **Symmetry < 2 pixels**: Rejects sources where the bounding box is not roughly square
 - **SNR >= 30**: Rejects faint or noisy detections
-- **MAD clipping on FWHM and ELONGATION**: Removes sources deviating more than 2 sigma from the plate median, where sigma is estimated as 1.4826 times the median absolute deviation. This catches morphological outliers that pass the hard cuts but are statistical anomalies for the plate.
 
-One filter that required careful calibration is the Median Absolute Deviation (MAD) clipping on FWHM and elongation. Solano describes computing the median and MAD for each image and removing sources deviating more than 2 sigma from the median. This is applied after the hard cuts (FWHM 2-7, elongation < 1.4) to remove morphological outliers relative to the plate's stellar population. The 1.4826 scaling factor converts MAD to a standard deviation estimate for normally distributed data.
+One filter that is deliberately omitted is the Median Absolute Deviation (MAD) clipping on FWHM and elongation. Solano describes computing the median and MAD within 30-arcmin tessellated regions and removing sources deviating more than 2 sigma from the local median. Testing showed that this removes real transients whose morphology legitimately differs from the stellar population. Transients are inherently morphological outliers, and MAD clipping penalises exactly that. Applying MAD clipping globally reduced recall by 30 percent and locally by 26 percent with no meaningful improvement in F1 score. The hard cuts on FWHM, elongation, and SPREAD_MODEL handle the worst artifacts without this step.
 
-### Step 4 Red v Blue Comparison
+### Step 4: Red Versus Blue Comparison
 
 This is the critical step that separates real transients from persistent sources. A source that appears on the red plate but not on the blue plate is a transient candidate, because it was only present during one of the two exposures (taken at different times). A source that appears on both plates is a persistent astronomical object and gets removed.
 
@@ -115,7 +113,7 @@ This step typically removes thousands of sources and is the primary reason the f
 
 Not all POSS-I fields have blue plate scans available on IRSA. If the blue plate cannot be downloaded, the pipeline falls back to red-only mode and skips this step. Use the `--red-only` flag to force this behavior intentionally.
 
-### Step 5 Catalog Crossmatch
+### Step 5: Catalog Crossmatch
 
 Surviving candidates are crossmatched against modern astronomical catalogs to remove any source that has a known counterpart today. The catalogs are queried via VizieR with a 5 degree search radius centered on the plate:
 
@@ -136,15 +134,15 @@ Villarroel confirmed that the published 107,000-source VASCO catalog was never c
 
 All query results are cached to disk in the `cache/` subdirectory. If you rerun the pipeline on the same plate, the cached results are loaded instantly. Clearing the cache forces fresh queries.
 
-### Step 6 Southern Hemisphere Exclusion
+### Step 6: Southern Hemisphere Exclusion
 
 POSS-I included some southern fringe plates that extend below declination -30 degrees. These were excluded from the published VASCO catalog. The pipeline applies a declination cutoff (default -30 degrees) and removes any candidate below that limit. This can be adjusted with the `--dec-min` flag if needed, but the default matches the published boundary.
 
-### Step 7 Cross-Plate Deduplication
+### Step 7: Cross-Plate Deduplication
 
 POSS-I plates overlap by about 1 degree at their edges. The same transient source can appear on two to four adjacent plates. For multi-plate runs, the pipeline can deduplicate by checking new candidates against previously processed results. Any candidate within 5 arcseconds of an existing detection in a previous plate's output is flagged as a duplicate and removed. This is only active when you provide a `--dedup-dir` pointing to the directory containing your previous `transients_*.csv` files.
 
-### Step 8 VASCO Comparison
+### Step 8: VASCO Comparison
 
 The final candidate list is crossmatched against the published VASCO catalog at 5 arcseconds. The pipeline reports recall (what fraction of VASCO entries recovered), precision (what fraction of our candidates match VASCO), and F1 score.
 
@@ -159,7 +157,7 @@ This processes plate XE582 (red) and XO582 (blue), applies all filters, runs the
 
 ### Validating Against VASCO
 
-If you have a copy of the VASCO catalog (see the section on obtaining it above), you can compare your results
+If you have a copy of the VASCO catalog (see the section on obtaining it above), you can compare your results:
 
 ```
 python3 poss_transients.py --plate 582 --vasco vasco_catalog.csv
@@ -215,13 +213,13 @@ Based on testing with plate XE582 (166 published VASCO transients):
 | Metric | Value |
 |--------|-------|
 | Sources extracted (red) | 74,330 |
-| After morphological filters | 46,967 |
-| After red-vs-blue comparison | 12,394 |
-| After catalog crossmatch | 314 |
+| After morphological filters | 44,424 |
+| After red-vs-blue comparison | 12,599 |
+| After catalog crossmatch | 241 |
 | VASCO detection rate | 99.4% (165/166 extracted) |
-| VASCO recall after all filters | 89.8% (149/166) |
-| Precision | 47.5% (149/314) |
-| F1 score | 0.621 |
+| VASCO recall after all filters | 86.7% (144/166) |
+| Precision | 59.8% (144/241) |
+| F1 score | 0.708 |
 
 ### Timing (single plate, SSD, 16 GB RAM)
 
@@ -229,13 +227,13 @@ Based on testing with plate XE582 (166 published VASCO transients):
 |------|------|
 | Plate download (400 MB) | 10 to 15 seconds |
 | SExtractor pass 1 | 30 to 40 seconds |
-| PSFEx | 15 to 25 minutes |
-| SExtractor pass 2 | 30 to 40 seconds |
+| PSFEx | 1 to 12 minutes |
+| SExtractor pass 2 | 10 to 20 minutes |
 | Gaia query (or cache load) | 2 to 4 minutes |
 | PanSTARRS query | 2 to 4 minutes |
 | SuperCOSMOS query | 1 to 2 minutes |
 | IR queries (if --ir enabled) | 3 to 6 minutes |
-| Total per plate | 25 to 40 minutes |
+| Total per plate | 35 to 55 minutes |
 
 ## Known Limits
 
@@ -247,7 +245,7 @@ Based on testing with plate XE582 (166 published VASCO transients):
 
 **Blue plate availability.** Not every POSS-I field has a blue plate scan on IRSA. When the blue plate is missing, the pipeline falls back to red-only mode, which produces more false positives. The red-versus-blue comparison is the single most important filter for precision.
 
-**Single-threaded extraction.** SExtractor and PSFEx are both single-threaded. The dominant time cost is PSFEx (15 to 25 minutes per plate). There is no way to speed this up on a single plate, but multiple plates can be processed in parallel.
+**Single-threaded extraction.** SExtractor and PSFEx are both single-threaded. The dominant time cost is SExtractor pass 2 with SPREAD_MODEL evaluation (10 to 20 minutes per plate). There is no way to speed this up on a single plate, but multiple plates can be processed in parallel.
 
 **VizieR query volume.** Each plate queries roughly 2 to 4 million catalog rows across the primary catalogs (Gaia, PanSTARRS, SuperCOSMOS). With `--ir` enabled, this increases to 5 to 10 million rows across seven catalogs. VizieR is a shared public resource. If you are processing many plates in rapid succession, space out your runs or use the cached results to minimize repeated queries.
 
