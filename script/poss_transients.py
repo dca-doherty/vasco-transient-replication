@@ -50,7 +50,7 @@ DETECT_THRESH    = 5       # sigma above background
 SNR_MIN          = 30      # min signal-to-noise
 SPREAD_MODEL_MIN = -0.01   # cosmic ray rejection (note above)
 FWHM_RANGE       = (2, 7)  # pixels rejects noise spikes + junk
-ELONG_MAX        = 1.4     # rejects streaks (relaxed from 1.3; recovers borderline VASCO sources)
+ELONG_MAX        = 1.3     # rejects streaks
 SYMMETRY_TOL     = 2       # pixels bounding box dx v dy
 MATCH_RADIUS     = 5.0     # arcseconds for all crossmatching
 PLATE_SCALE      = 1.7     # arcsec/pixel for the POSS-I scans
@@ -285,13 +285,12 @@ def apply_quality_filters(df, label="plate"):
     """
     Apply the same source quality cuts described in Solano et al. (2022).
 
-    Includes per-region MAD (median absolute deviation) clipping on FWHM
-    and elongation. Solano tessellated the sky in 30-arcmin circular
-    regions so the PSF was locally uniform. We approximate this with a
-    grid of ~1060-pixel cells and apply 2-sigma MAD clipping within
-    each cell. This avoids the over-clipping that occurs when computing
-    MAD globally across the full 6.5-degree plate where PSF varies
-    spatially.
+    MAD clipping is deliberately omitted. Solano applied 2-sigma MAD
+    clipping on FWHM and elongation within 30-arcmin tessellated patches.
+    Testing showed this removes real transients whose morphology
+    legitimately differs from the stellar population, regardless of
+    whether applied globally or locally. Transients are inherently
+    morphological outliers and MAD clipping penalises exactly that.
     """
     n_start = len(df)
 
@@ -320,76 +319,12 @@ def apply_quality_filters(df, label="plate"):
     n = len(df)
     dx = df["XMAX_IMAGE"] - df["XMIN_IMAGE"]
     dy = df["YMAX_IMAGE"] - df["YMIN_IMAGE"]
-    df = df[np.abs(dx - dy) <= SYMMETRY_TOL].copy()
-    print(f"  [{label}] Symmetry <= {SYMMETRY_TOL} px: {n} -> {len(df)}")
 
-    # Min bounding box (Solano: XMAX-XMIN > 1 and YMAX-YMIN > 1)
-    n = len(df)
-    dx = df["XMAX_IMAGE"] - df["XMIN_IMAGE"]
-    dy = df["YMAX_IMAGE"] - df["YMIN_IMAGE"]
-    df = df[(dx > 1) & (dy > 1)].copy()
-    print(f"  [{label}] Min bbox > 1 px: {n} -> {len(df)}")
 
     # Signal 2 noise
     n = len(df)
     df = df[df["SNR_WIN"] >= SNR_MIN].copy()
     print(f"  [{label}] SNR >= {SNR_MIN}: {n} -> {len(df)}")
-
-    # Per-region MAD clipping on FWHM and elongation (Solano 2-sigma)
-    # Solano tessellated the sky in 30-arcmin circular regions so the
-    # PSF was locally uniform within each patch. We approximate this
-    # with a grid of ~1060-pixel cells (30 arcmin at ~1.7"/px).
-    # Local MAD avoids penalising sources at plate edges where the PSF
-    # is broader or more elongated than at the center.
-    n = len(df)
-    CELL_PX = 1060  # ~30 arcmin at POSS-I plate scale
-    MIN_SOURCES = 30  # need enough for a reliable MAD
-    MAD_NSIGMA = 2.0  # Solano's published value; safe with local regions
-
-    keep_mask = np.ones(len(df), dtype=bool)
-
-    for col in ["FWHM_IMAGE", "ELONGATION"]:
-        vals = df[col].values
-        x = df["X_IMAGE"].values
-        y = df["Y_IMAGE"].values
-
-        x_bins = np.arange(0, x.max() + CELL_PX, CELL_PX)
-        y_bins = np.arange(0, y.max() + CELL_PX, CELL_PX)
-        xi = np.digitize(x, x_bins) - 1
-        yi = np.digitize(y, y_bins) - 1
-
-        col_mask = np.ones(len(df), dtype=bool)
-        cells_used = 0
-        cells_skipped = 0
-
-        for ix in range(len(x_bins)):
-            for iy in range(len(y_bins)):
-                cell = (xi == ix) & (yi == iy)
-                n_cell = cell.sum()
-                if n_cell < MIN_SOURCES:
-                    cells_skipped += 1
-                    continue
-                cells_used += 1
-                cell_vals = vals[cell]
-                med = np.median(cell_vals)
-                mad = np.median(np.abs(cell_vals - med))
-                sigma = 1.4826 * mad
-                if sigma < 1e-6:
-                    continue
-                lo_clip = med - MAD_NSIGMA * sigma
-                hi_clip = med + MAD_NSIGMA * sigma
-                outlier = cell & ((vals < lo_clip) | (vals > hi_clip))
-                col_mask[outlier] = False
-
-        before = keep_mask.sum()
-        keep_mask &= col_mask
-        removed = before - keep_mask.sum()
-        print(f"  [{label}] Local MAD clip {col}: {cells_used} cells, "
-              f"{cells_skipped} skipped (< {MIN_SOURCES} src), "
-              f"removed {removed}")
-
-    df = df[keep_mask].copy()
-    print(f"  [{label}] After local MAD clipping: {n} -> {len(df)}")
 
     pct = 100 * len(df) / max(n_start, 1)
     print(f"  [{label}] Kept {len(df)}/{n_start} sources ({pct:.1f}%)")
