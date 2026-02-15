@@ -726,7 +726,7 @@ def main():
     plate = args.plate
     outdir = args.output_dir
     os.makedirs(outdir, exist_ok=True)
-    cache_dir = os.path.join(outdir, "cache")
+    cache_dir = os.path.join(outdir, f"cache_{plate}")
 
     print("=" * 60)
     print(f"  POSS-I Transient Detection Pipeline")
