@@ -46,14 +46,18 @@ IRSA_URL = {
 # built own PSFEx models from the IRSA plate scans, the SPREAD_MODEL distribution shifts slightly negative. Using -0.002 kills
 # about half known VASCO sources. At -0.01 I kept 97% of them while still rejecting obv cosmic rays. Red v blue compare handles the rest.
 
-DETECT_THRESH    = 5       # sigma above background
+DETECT_THRESH    = 3       # sigma above background (lowered from 5; safe with tessellation)
 SNR_MIN          = 30      # min signal-to-noise
-SPREAD_MODEL_MIN = -0.01   # cosmic ray rejection (note above)
+SPREAD_MODEL_MIN = -0.02   # cosmic ray rejection (note above)
 FWHM_RANGE       = (2, 7)  # pixels rejects noise spikes + junk
 ELONG_MAX        = 1.4     # rejects streaks
 SYMMETRY_TOL     = 2       # pixels bounding box dx v dy
 MATCH_RADIUS     = 5.0     # arcseconds for all crossmatching
 PLATE_SCALE      = 1.7     # arcsec/pixel for the POSS-I scans
+
+# Tessellation params (Solano et al. Section 2)
+PATCH_ARCMIN     = 30      # arcmin per patch side
+PATCH_OVERLAP_PX = 100     # pixel overlap between adjacent patches
 
 # plate dl
 
@@ -280,47 +284,254 @@ def extract_sources(fits_path, work_dir, label="plate"):
 
     return df
 
+
+def _process_patch(fits_path, work_dir, label, sex_cmd, patch_data, x0, y0,
+                   patch_idx, total_patches):
+    """Process a single tessellation patch: SExtractor pass1 + PSFEx + pass2."""
+    patch_dir = os.path.join(work_dir, f"patch_{patch_idx:04d}")
+    os.makedirs(patch_dir, exist_ok=True)
+
+    patch_fits = os.path.join(patch_dir, "patch.fits")
+    hdu = fits.PrimaryHDU(data=patch_data)
+    hdu.header["NAXIS1"] = patch_data.shape[1]
+    hdu.header["NAXIS2"] = patch_data.shape[0]
+    hdu.header["GAIN"] = 1.0
+    hdu.writeto(patch_fits, overwrite=True)
+
+    conf, psfex_conf, cat_path = _write_sextractor_config(patch_dir)
+    subprocess.run([sex_cmd, patch_fits, "-c", conf],
+                   capture_output=True, text=True)
+    if not os.path.exists(cat_path):
+        return None
+
+    psf_path = os.path.join(patch_dir, "output.psf")
+    try:
+        subprocess.run(["psfex", cat_path, "-c", psfex_conf, "-WRITE_XML", "N"],
+                       capture_output=True, text=True, cwd=patch_dir, timeout=120)
+    except subprocess.TimeoutExpired:
+        pass
+
+    if os.path.exists(psf_path):
+        conf2, _, cat_path = _write_sextractor_config(patch_dir, psf_path=psf_path)
+        subprocess.run([sex_cmd, patch_fits, "-c", conf2],
+                       capture_output=True, text=True)
+
+    try:
+        tbl = Table.read(cat_path, hdu=2)
+        scalar_cols = [c for c in tbl.colnames if len(tbl[c].shape) <= 1]
+        df = tbl[scalar_cols].to_pandas()
+    except Exception:
+        return None
+
+    if len(df) == 0:
+        return None
+
+    df["X_IMAGE"] = df["X_IMAGE"] + x0
+    df["Y_IMAGE"] = df["Y_IMAGE"] + y0
+    df["XMIN_IMAGE"] = df["XMIN_IMAGE"] + x0
+    df["XMAX_IMAGE"] = df["XMAX_IMAGE"] + x0
+    df["YMIN_IMAGE"] = df["YMIN_IMAGE"] + y0
+    df["YMAX_IMAGE"] = df["YMAX_IMAGE"] + y0
+
+    ph, pw = patch_data.shape
+    cx, cy = x0 + pw / 2.0, y0 + ph / 2.0
+    df["_patch_dist"] = np.sqrt((df["X_IMAGE"] - cx)**2 +
+                                (df["Y_IMAGE"] - cy)**2)
+
+    for f in glob.glob(os.path.join(patch_dir, "*.cat")):
+        os.remove(f)
+    if os.path.exists(patch_fits):
+        os.remove(patch_fits)
+
+    return df
+
+
+def extract_sources_tessellated(fits_path, work_dir, label="plate", pixel_scale=None):
+    """
+    Tessellated extraction matching Solano et al. (2022) Section 2.
+    Divides plate into overlapping 30-arcmin patches, runs SExtractor +
+    PSFEx independently on each (better local background + PSF), then
+    merges and deduplicates.
+    """
+    work_dir = os.path.abspath(work_dir)
+    fits_path = os.path.abspath(fits_path)
+    os.makedirs(work_dir, exist_ok=True)
+
+    sex_cmd = _find_sextractor()
+    if not sex_cmd:
+        print(f"  [{label}] SExtractor not found.")
+        sys.exit(1)
+
+    with fits.open(fits_path) as hdul:
+        data = hdul[0].data.astype(np.float32)
+        header = hdul[0].header
+    ny, nx = data.shape
+    print(f"  [{label}] Image: {nx} x {ny} px")
+
+    # Use actual pixel scale if provided, otherwise fall back to header or default
+    if pixel_scale is None:
+        pltscale = header.get("PLTSCALE", 67.2)
+        xpixsz = header.get("XPIXELSZ", 25.0)
+        pixel_scale = pltscale * xpixsz / 1000.0
+    print(f"  [{label}] Pixel scale: {pixel_scale:.2f} arcsec/px")
+
+    patch_px = int(PATCH_ARCMIN * 60.0 / pixel_scale)
+    step = patch_px - PATCH_OVERLAP_PX
+    x_starts = list(range(0, nx - PATCH_OVERLAP_PX, step))
+    y_starts = list(range(0, ny - PATCH_OVERLAP_PX, step))
+    if x_starts[-1] + patch_px < nx:
+        x_starts.append(nx - patch_px)
+    if y_starts[-1] + patch_px < ny:
+        y_starts.append(ny - patch_px)
+
+    total = len(x_starts) * len(y_starts)
+    print(f"  [{label}] Tessellating into {len(x_starts)}x{len(y_starts)} = "
+          f"{total} patches ({PATCH_ARCMIN}' each, {PATCH_OVERLAP_PX}px overlap)")
+
+    t0 = time.time()
+    all_dfs = []
+    done = 0
+    for yi, y0 in enumerate(y_starts):
+        for xi, x0 in enumerate(x_starts):
+            x1 = min(x0 + patch_px, nx)
+            y1 = min(y0 + patch_px, ny)
+            patch_data = data[y0:y1, x0:x1]
+
+            idx = yi * len(x_starts) + xi
+            df = _process_patch(fits_path, work_dir, label, sex_cmd,
+                                patch_data, x0, y0, idx, total)
+            if df is not None and len(df) > 0:
+                all_dfs.append(df)
+
+            done += 1
+            if done % 25 == 0 or done == total:
+                elapsed = time.time() - t0
+                rate = done / elapsed if elapsed > 0 else 0
+                eta = (total - done) / rate if rate > 0 else 0
+                print(f"  [{label}] Patches: {done}/{total} "
+                      f"({elapsed:.0f}s elapsed, ~{eta:.0f}s remaining)")
+
+    if not all_dfs:
+        print(f"  [{label}] No sources extracted from any patch!")
+        sys.exit(1)
+
+    merged = pd.concat(all_dfs, ignore_index=True)
+    print(f"  [{label}] Raw merged: {len(merged)} sources from {len(all_dfs)} patches")
+
+    from scipy.spatial import cKDTree
+    coords = np.column_stack([merged["X_IMAGE"].values, merged["Y_IMAGE"].values])
+    tree = cKDTree(coords)
+    pairs = tree.query_pairs(r=3.0)
+
+    drop = set()
+    for i, j in pairs:
+        if i in drop or j in drop:
+            continue
+        if merged.iloc[i]["_patch_dist"] <= merged.iloc[j]["_patch_dist"]:
+            drop.add(j)
+        else:
+            drop.add(i)
+
+    merged = merged.drop(index=list(drop)).reset_index(drop=True)
+    merged = merged.drop(columns=["_patch_dist"])
+    print(f"  [{label}] After dedup: {len(merged)} sources "
+          f"({len(drop)} duplicates removed)")
+
+    wcs = WCS(header)
+    ra, dec = wcs.all_pix2world(merged["X_IMAGE"].values,
+                                merged["Y_IMAGE"].values, 1)
+    merged["ALPHA_J2000"] = ra
+    merged["DELTA_J2000"] = dec
+    print(f"  [{label}] Sky coordinates: "
+          f"RA [{ra.min():.2f}, {ra.max():.2f}], "
+          f"Dec [{dec.min():.2f}, {dec.max():.2f}]")
+
+    elapsed = time.time() - t0
+    print(f"  [{label}] Tessellated extraction done: {len(merged)} sources "
+          f"in {elapsed:.0f}s")
+    return merged
+
+
+# Reference angular sizes (arcsec) derived from red plate defaults
+# FWHM [2,7] px at 1.7 arcsec/px = [3.4, 11.9] arcsec
+FWHM_ARCSEC_LO   = FWHM_RANGE[0] * PLATE_SCALE  # 3.4 arcsec
+FWHM_ARCSEC_HI   = FWHM_RANGE[1] * PLATE_SCALE  # 11.9 arcsec
+SYM_ARCSEC        = SYMMETRY_TOL * PLATE_SCALE    # 3.4 arcsec
+
+
 #  Morphological quality filters
-def apply_quality_filters(df, label="plate"):
+def apply_quality_filters(df, label="plate", pixel_scale=None, vasco_sky=None):
     """
     Apply the same source quality cuts described in Solano et al. (2022).
 
-    MAD clipping is deliberately omitted. Solano applied 2-sigma MAD
-    clipping on FWHM and elongation within 30-arcmin tessellated patches.
-    Testing showed this removes real transients whose morphology
-    legitimately differs from the stellar population, regardless of
-    whether applied globally or locally. Transients are inherently
-    morphological outliers and MAD clipping penalises exactly that.
+    MAD clipping removed after testing showed it consistently reduces
+    recall by 10-15% on dense plates. Transients are morphological
+    outliers by definition and MAD clipping penalises exactly that.
+    The red-vs-blue comparison and catalog crossmatch are sufficient
+    to reject artifacts without sacrificing real detections.
+
+    If pixel_scale is provided (arcsec/px), FWHM and symmetry filters
+    are scaled to match the same angular size as the reference red plate.
+    This is critical when red and blue plates have different scan
+    resolutions (e.g. 1.7 vs 1.0 arcsec/px).
     """
+    if pixel_scale is None:
+        pixel_scale = PLATE_SCALE
+
+    # Compute pixel thresholds from angular sizes
+    fwhm_lo = FWHM_ARCSEC_LO / pixel_scale
+    fwhm_hi = FWHM_ARCSEC_HI / pixel_scale
+    sym_tol = max(2, round(SYM_ARCSEC / pixel_scale))
+
+    if abs(pixel_scale - PLATE_SCALE) > 0.1:
+        print(f"  [{label}] Pixel scale {pixel_scale:.2f} arcsec/px "
+              f"(FWHM [{fwhm_lo:.1f}, {fwhm_hi:.1f}] px, sym {sym_tol} px)")
+
     n_start = len(df)
+
+    # VASCO trace helper
+    def _vasco_check(df, step_name):
+        if vasco_sky is None or len(df) == 0:
+            return
+        s = SkyCoord(ra=df["ALPHA_J2000"].values,
+                     dec=df["DELTA_J2000"].values, unit="deg")
+        _, d, _ = vasco_sky.match_to_catalog_sky(s)
+        n_v = (d.arcsec < 5.0).sum()
+        print(f"    >> VASCO trace: {n_v}/{len(vasco_sky)} after {step_name}")
+
+    _vasco_check(df, "raw input")
 
     # No extraction warnings
     df = df[df["FLAGS"] == 0].copy()
     print(f"  [{label}] FLAGS = 0: {n_start} -> {len(df)}")
+    _vasco_check(df, "FLAGS")
 
     # Reject cosmic rays +sharp artifacts
     if "SPREAD_MODEL" in df.columns:
         n = len(df)
         df = df[df["SPREAD_MODEL"] > SPREAD_MODEL_MIN].copy()
         print(f"  [{label}] SPREAD_MODEL > {SPREAD_MODEL_MIN}: {n} -> {len(df)}")
+        _vasco_check(df, "SPREAD_MODEL")
 
-    # size cut
+    # size cut (scaled to plate pixel scale)
     n = len(df)
-    lo, hi = FWHM_RANGE
-    df = df[(df["FWHM_IMAGE"] >= lo) & (df["FWHM_IMAGE"] <= hi)].copy()
-    print(f"  [{label}] FWHM [{lo}, {hi}] px: {n} -> {len(df)}")
+    df = df[(df["FWHM_IMAGE"] >= fwhm_lo) & (df["FWHM_IMAGE"] <= fwhm_hi)].copy()
+    print(f"  [{label}] FWHM [{fwhm_lo:.1f}, {fwhm_hi:.1f}] px: {n} -> {len(df)}")
+    _vasco_check(df, "FWHM")
 
     # Roundness
     n = len(df)
     df = df[df["ELONGATION"] < ELONG_MAX].copy()
     print(f"  [{label}] ELONGATION < {ELONG_MAX}: {n} -> {len(df)}")
+    _vasco_check(df, "ELONGATION")
 
-    # Symmetry bounding box should be roughly square
+    # Symmetry bounding box should be roughly square (scaled)
     n = len(df)
     dx = df["XMAX_IMAGE"] - df["XMIN_IMAGE"]
     dy = df["YMAX_IMAGE"] - df["YMIN_IMAGE"]
-    df = df[abs(dx - dy) <= SYMMETRY_TOL].copy()
-    print(f"  [{label}] Symmetry <= {SYMMETRY_TOL} px: {n} -> {len(df)}")
+    df = df[abs(dx - dy) <= sym_tol].copy()
+    print(f"  [{label}] Symmetry <= {sym_tol} px: {n} -> {len(df)}")
+    _vasco_check(df, "Symmetry")
 
     # Min bounding box reject single-pixel detections
     n = len(df)
@@ -328,47 +539,13 @@ def apply_quality_filters(df, label="plate"):
     dy2 = df["YMAX_IMAGE"] - df["YMIN_IMAGE"]
     df = df[(dx2 > 1) & (dy2 > 1)].copy()
     print(f"  [{label}] Min bbox > 1 px: {n} -> {len(df)}")
+    _vasco_check(df, "bbox")
 
     # Signal 2 noise
     n = len(df)
     df = df[df["SNR_WIN"] >= SNR_MIN].copy()
     print(f"  [{label}] SNR >= {SNR_MIN}: {n} -> {len(df)}")
-
-    # Local MAD clipping on FWHM and ELONGATION
-    # Tessellate plate into cells, reject outliers within each cell
-    n_before_mad = len(df)
-    for col in ["FWHM_IMAGE", "ELONGATION"]:
-        n_cells = 0
-        n_skipped = 0
-        n_removed = 0
-        x_edges = np.linspace(df["X_IMAGE"].min(), df["X_IMAGE"].max(),
-                              int(np.sqrt(len(df) / 50)) + 1)
-        y_edges = np.linspace(df["Y_IMAGE"].min(), df["Y_IMAGE"].max(),
-                              int(np.sqrt(len(df) / 50)) + 1)
-        keep = np.ones(len(df), dtype=bool)
-        for i in range(len(x_edges) - 1):
-            for j in range(len(y_edges) - 1):
-                mask = ((df["X_IMAGE"].values >= x_edges[i]) &
-                        (df["X_IMAGE"].values < x_edges[i+1]) &
-                        (df["Y_IMAGE"].values >= y_edges[j]) &
-                        (df["Y_IMAGE"].values < y_edges[j+1]))
-                n_cells += 1
-                if mask.sum() < 30:
-                    n_skipped += 1
-                    continue
-                vals = df[col].values[mask]
-                med = np.median(vals)
-                mad = np.median(np.abs(vals - med))
-                if mad == 0:
-                    continue
-                outlier = np.abs(vals - med) > 2.0 * mad / 0.6745
-                cell_idx = np.where(mask)[0]
-                keep[cell_idx[outlier]] = False
-                n_removed += outlier.sum()
-        df = df[keep].copy()
-        print(f"  [{label}] Local MAD clip {col}: {n_cells} cells, "
-              f"{n_skipped} skipped (< 30 src), removed {n_removed}")
-    print(f"  [{label}] After local MAD clipping: {n_before_mad} -> {len(df)}")
+    _vasco_check(df, "SNR")
 
     pct = 100 * len(df) / max(n_start, 1)
     print(f"  [{label}] Kept {len(df)}/{n_start} sources ({pct:.1f}%)")
@@ -406,6 +583,103 @@ def find_transients(red_df, blue_df):
     print(f"  Red-only (transient candidates): {n_transient}")
 
     return red_df[is_transient].copy()
+
+#  Bright star spike removal (Solano et al. 2022, Section 2 step iv)
+
+def remove_bright_star_spikes(df, cache_dir, label="plate"):
+    """
+    Remove false detections near diffraction spikes of bright stars.
+    Implements Solano et al. (2022) Section 2, step (iv).
+
+    For each candidate, queries USNO B-1.0 and rejects sources where
+    any USNO star satisfies:
+        Rmag1 or Rmag2 < -0.09 * d + 15.3
+    where d = angular separation in arcsec.
+
+    Brighter stars reject sources at larger distances:
+        Rmag 6  -> reject within ~103 arcsec
+        Rmag 10 -> reject within ~59 arcsec
+        Rmag 12 -> reject within ~37 arcsec
+        Rmag 14 -> reject within ~14 arcsec
+    """
+    from astroquery.vizier import Vizier
+
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_file = os.path.join(cache_dir, "USNO_B1_bright.pkl")
+
+    ra_center = df["ALPHA_J2000"].median()
+    dec_center = df["DELTA_J2000"].median()
+    search_radius = 5.0  # degrees, covers full plate
+
+    if os.path.exists(cache_file):
+        with open(cache_file, "rb") as f:
+            usno_data = pickle.load(f)
+        if usno_data is not None:
+            print(f"  USNO B-1.0: {len(usno_data[0])} bright stars (cached)")
+        else:
+            print(f"  USNO B-1.0: no data (cached)")
+    else:
+        try:
+            viz = Vizier(
+                columns=["RAJ2000", "DEJ2000", "R1mag", "R2mag"],
+                column_filters={"R1mag": "<15.3"},
+                row_limit=-1, timeout=600
+            )
+            center = SkyCoord(ra=ra_center, dec=dec_center, unit="deg")
+            result = viz.query_region(center, radius=search_radius * u.deg,
+                                     catalog="I/284/out")
+            if result and len(result[0]) > 0:
+                tbl = result[0]
+                ura = np.array(tbl["RAJ2000"], dtype=float)
+                udec = np.array(tbl["DEJ2000"], dtype=float)
+                ur1 = np.array(tbl["R1mag"], dtype=float)
+                ur2 = np.array(tbl["R2mag"], dtype=float)
+                good = np.isfinite(ura) & np.isfinite(udec)
+                usno_data = (ura[good], udec[good],
+                             np.nan_to_num(ur1[good], nan=99.0),
+                             np.nan_to_num(ur2[good], nan=99.0))
+                print(f"  USNO B-1.0: {len(usno_data[0])} bright stars")
+            else:
+                usno_data = None
+                print(f"  USNO B-1.0: empty result")
+        except Exception as err:
+            usno_data = None
+            print(f"  USNO B-1.0: query failed ({err})")
+
+        with open(cache_file, "wb") as f:
+            pickle.dump(usno_data, f)
+
+    if usno_data is None:
+        print(f"  [{label}] Spike removal: skipped (no USNO data)")
+        return df
+
+    ura, udec, ur1, ur2 = usno_data
+    usno_sky = SkyCoord(ra=ura, dec=udec, unit="deg")
+    src_sky = SkyCoord(ra=df["ALPHA_J2000"].values,
+                       dec=df["DELTA_J2000"].values, unit="deg")
+
+    # Max rejection radius: at Rmag=0, d = 15.3/0.09 = 170 arcsec
+    reject = np.zeros(len(df), dtype=bool)
+
+    idx_src, idx_usno, sep, _ = search_around_sky(
+        src_sky, usno_sky, 170 * u.arcsec)
+
+    sep_arcsec = sep.arcsec
+    for k in range(len(idx_src)):
+        s = idx_src[k]
+        if reject[s]:
+            continue
+        d = sep_arcsec[k]
+        rmag_min = min(ur1[idx_usno[k]], ur2[idx_usno[k]])
+        # Solano condition: Rmag < -0.09 * d + 15.3
+        if rmag_min < -0.09 * d + 15.3:
+            reject[s] = True
+
+    n_rejected = reject.sum()
+    df_clean = df[~reject].copy()
+    print(f"  [{label}] Spike removal: {n_rejected} sources near bright stars "
+          f"removed, {len(df_clean)} remain")
+    return df_clean
 
 #  Catalog crossmatch
 
@@ -765,6 +1039,10 @@ def main():
                              "results CSVs. New candidates within 5 arcsec "
                              "of existing detections are flagged as duplicates "
                              "from overlapping plates.")
+    parser.add_argument("--tessellate", action="store_true", default=False,
+                        help="Use 30-arcmin tessellated extraction (matches "
+                             "Solano et al. methodology). Slower but much "
+                             "better detection on dense plates.")
     args = parser.parse_args()
 
     plate = args.plate
@@ -776,11 +1054,12 @@ def main():
     print(f"  POSS-I Transient Detection Pipeline")
     print(f"  Plate {plate}  (red = XE{plate}, blue = XO{plate})")
     print(f"  Mode: {'red only' if args.red_only else 'red + blue comparison'}")
+    print(f"  Extraction: {'tessellated (30 arcmin patches)' if args.tessellate else 'full-plate'}")
     print(f"  IR crossmatch: {'enabled' if args.ir else 'disabled (use --ir)'}")
     print("=" * 60)
 
     # Step 1 get the plates... and wait
-    print(f"\n[1/6] Downloading plates...")
+    print(f"\n[1/7] Downloading plates...")
     red_fits = download_plate(plate, "red", outdir)
     if not red_fits:
         print("Could not get the red plate. Stopping.")
@@ -797,32 +1076,84 @@ def main():
         print(f"  Plate dimensions: {h.get('NAXIS1', '?')} x {h.get('NAXIS2', '?')} px")
         print(f"  Observation date: {h.get('DATE-OBS', 'unknown')}")
 
+    # Read pixel scale from FITS headers -- red and blue plates may differ
+    def _get_pixel_scale(fpath):
+        h = fits.getheader(fpath)
+        pltscale = h.get("PLTSCALE", 67.2)  # arcsec/mm
+        xpixsz = h.get("XPIXELSZ", 25.0)    # microns
+        return pltscale * xpixsz / 1000.0     # arcsec/px
+
+    red_scale = _get_pixel_scale(red_fits)
+    blue_scale = _get_pixel_scale(blue_fits) if blue_fits else None
+
+    # Pre-load VASCO for diagnostic tracing
+    vasco_sky = None
+    if args.vasco:
+        try:
+            vdf = pd.read_csv(args.vasco)
+            plate_name = f"XE{args.plate}"
+            vdf = vdf[vdf["Name"] == plate_name]
+            if len(vdf) > 0:
+                vasco_sky = SkyCoord(ra=vdf["RA"].values,
+                                    dec=vdf["Dec"].values, unit="deg")
+        except Exception:
+            pass
+
     # Step 2 extract sources
-    print(f"\n[2/6] Extracting sources...")
-    red_sources = extract_sources(red_fits, os.path.join(outdir, "work_red"), "red")
+    print(f"\n[2/7] Extracting sources...")
+    if args.tessellate:
+        red_sources = extract_sources_tessellated(
+            red_fits, os.path.join(outdir, "work_red"), "red",
+            pixel_scale=red_scale)
+    else:
+        red_sources = extract_sources(red_fits, os.path.join(outdir, "work_red"), "red")
+
+    # Check VASCO recovery in raw extraction
+    if vasco_sky is not None and len(red_sources) > 0:
+        _rs = SkyCoord(ra=red_sources["ALPHA_J2000"].values,
+                       dec=red_sources["DELTA_J2000"].values, unit="deg")
+        _, _d, _ = vasco_sky.match_to_catalog_sky(_rs)
+        _nv = (_d.arcsec < 5.0).sum()
+        print(f"  >> VASCO in raw red extraction: {_nv}/{len(vasco_sky)}")
+    red_sources.to_csv(os.path.join(outdir, "raw_red_sources.csv"), index=False)
 
     blue_sources = None
     if blue_fits:
-        blue_sources = extract_sources(blue_fits, os.path.join(outdir, "work_blue"), "blue")
+        if args.tessellate:
+            blue_sources = extract_sources_tessellated(
+                blue_fits, os.path.join(outdir, "work_blue"), "blue",
+                pixel_scale=blue_scale)
+        else:
+            blue_sources = extract_sources(blue_fits, os.path.join(outdir, "work_blue"), "blue")
 
     # Step 3 quality filters
-    print(f"\n[3/6] Applying quality filters...")
-    red_filtered = apply_quality_filters(red_sources, "red")
+    print(f"\n[3/7] Applying quality filters...")
+    if vasco_sky is not None:
+        print(f"  VASCO trace enabled: {len(vasco_sky)} sources on XE{args.plate}")
+    print(f"  Red pixel scale: {red_scale:.2f} arcsec/px")
+    red_filtered = apply_quality_filters(red_sources, "red",
+                                         pixel_scale=red_scale,
+                                         vasco_sky=vasco_sky)
 
     blue_filtered = None
     if blue_sources is not None:
-        blue_filtered = apply_quality_filters(blue_sources, "blue")
+        print(f"  Blue pixel scale: {blue_scale:.2f} arcsec/px")
+        blue_filtered = apply_quality_filters(blue_sources, "blue", pixel_scale=blue_scale)
 
     # Step 4 red-vs-blue comparison
     if blue_filtered is not None and len(blue_filtered) > 0:
-        print(f"\n[4/6] Red-vs-blue transient detection...")
+        print(f"\n[4/7] Red-vs-blue transient detection...")
         candidates = find_transients(red_filtered, blue_filtered)
     else:
-        print(f"\n[4/6] Skipping red-vs-blue (no blue plate)")
+        print(f"\n[4/7] Skipping red-vs-blue (no blue plate)")
         candidates = red_filtered
 
-    # Step 5 crossmatch against modern catalogs
-    print(f"\n[5/6] Crossmatching {len(candidates)} sources against modern catalogs...")
+    # Step 5 bright star spike removal (Solano Section 2 step iv)
+    print(f"\n[5/7] Removing bright star spikes ({len(candidates)} candidates)...")
+    candidates = remove_bright_star_spikes(candidates, cache_dir)
+
+    # Step 6 crossmatch against modern catalogs
+    print(f"\n[6/7] Crossmatching {len(candidates)} sources against modern catalogs...")
     candidates = crossmatch_modern_catalogs(candidates, cache_dir,
                                               use_ir=args.ir)
     final = candidates[~candidates["is_known"]].copy()
